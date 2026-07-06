@@ -74,15 +74,12 @@ This project has no local emulation of DynamoDB/S3/Step Functions running
 by default -- it uses **`moto`** to mock AWS APIs in-process for both unit
 and integration tests, which is faster and more deterministic than running
 LocalStack or DynamoDB Local containers, and requires no Docker for the test
-suite itself (Docker is still needed for `sam build`/`sam local invoke`
-once Lambda packaging exists from Phase 2 onward).
+suite itself (Docker is still needed for `sam build`/`sam local invoke`).
 
 ```python
-# Example shape of an integration test (implemented in Phase 3)
-from moto import mock_aws
-
-@mock_aws
-def test_job_repository_persists_job() -> None:
+# tests/integration/infrastructure/persistence/test_dynamodb_job_repository.py
+def test_create_then_get_round_trips_all_fields(self, jobs_table: Table) -> None:
+    repository = DynamoDbJobRepository(jobs_table)
     ...  # real boto3 calls hit moto's in-memory AWS, not a real account
 ```
 

@@ -773,6 +773,15 @@ Resources:
       PrimaryContainer:
         Image: !Ref SklearnContainerImage
         ModelDataUrl: !Sub 's3://${ModelArtifactsBucket}/${ModelArtifactS3Key}'
+        # Tells the prebuilt container's inference toolkit to load
+        # code/inference.py from inside model.tar.gz (see ml/train.py,
+        # ml/inference.py, and ADR-0009) instead of expecting a built-in
+        # scikit-learn Estimator's default serve behavior.
+        Environment:
+          SAGEMAKER_PROGRAM: inference.py
+          SAGEMAKER_SUBMIT_DIRECTORY: /opt/ml/model/code
+          SAGEMAKER_CONTAINER_LOG_LEVEL: '20'
+          SAGEMAKER_REGION: !Ref AWS::Region
 
   # --- Step Functions ---------------------------------------------------------------
 

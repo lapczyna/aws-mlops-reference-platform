@@ -149,9 +149,10 @@ stateDiagram-v2
     end note
 ```
 
-This ASL definition ships as `statemachine/job_orchestration.asl.json` as of
-**Phase 2** (infrastructure only -- `ValidateInput` and `RecordSuccess`/
-`RecordFailure` are placeholder Lambda handlers until Phase 3).
+This ASL definition ships as `statemachine/job_orchestration.asl.json`.
+`ValidateInput`, `RecordSuccess`, and `RecordFailure` are backed by real
+Lambda handlers (`ValidateJobInput` and `RecordJobOutcome` use cases,
+implemented in Phase 3).
 
 ## Data model summary
 
@@ -193,7 +194,7 @@ configurable retention window (defaults: 7 and 30 days respectively) to
 bound storage cost; the model artifacts bucket has no expiration on current
 versions, only a bound on how many noncurrent (superseded) versions persist.
 
-## API surface (contract; infrastructure deployed in Phase 2, behavior implemented in Phase 3)
+## API surface
 
 | Method | Path                    | Purpose                                                  |
 | ------ | ------------------------ | ----------------------------------------------------------- |
@@ -205,6 +206,8 @@ versions, only a bound on how many noncurrent (superseded) versions persist.
 Request/response schemas are enforced with API Gateway request validation
 models (JSON Schema) -- rejecting malformed input at the edge, before it
 reaches Lambda. See [ADR-0006](../adr/0006-api-gateway-rest-api-choice.md).
+`POST /jobs` is safe to retry with the same `job_id`: see
+[ADR-0013](../adr/0013-idempotent-job-submission.md).
 
 ## AWS Well-Architected Framework mapping
 

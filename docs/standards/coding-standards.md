@@ -112,8 +112,8 @@ Configuration follows [12-factor](https://12factor.net/config): all
 environment-specific values (table names, bucket names, ARNs) are injected
 via Lambda environment variables set by the SAM template -- never
 hard-coded, never read from a checked-in config file per environment.
-Application code accesses configuration through a single typed
-`shared/config.py` module (implemented in Phase 3), not scattered
+Application code accesses configuration through the single typed
+`shared/config.py` module (`Settings`/`get_settings()`), not scattered
 `os.environ[...]` calls.
 
 ## Docstrings

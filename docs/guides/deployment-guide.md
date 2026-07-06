@@ -6,11 +6,14 @@ parameterization philosophy), see the
 [deployment strategy guide](deployment-strategy.md) written in Phase 1 --
 this document is the "how," that one is the "why."
 
-As of Phase 2, deploying the stack stands up the full architecture with
-placeholder Lambda handlers (HTTP 501 / stubbed Step Functions responses).
-Real behavior lands in Phase 3. Deploying now is still meaningful: it
-proves the infrastructure, IAM policies, and service wiring are correct
-before any application logic is layered on top.
+As of Phase 3, deploying the stack stands up the full architecture with
+real application behavior end to end. The one piece that still needs a
+manual step after deployment is the trained model artifact -- SageMaker's
+`CreateModel` API registers the model's metadata without validating that
+the artifact actually exists yet (see
+[ADR-0009](../adr/0009-sagemaker-model-artifact-parameterization.md)), so
+run [`scripts/package_model.sh`](../../scripts/package_model.sh) after your
+first deploy to a given environment before submitting a real job.
 
 ## Prerequisites
 
@@ -86,27 +89,29 @@ aws cloudformation describe-stacks \
   --stack-name batch-inference-dev \
   --query "Stacks[0].Outputs"
 
-# The placeholder endpoints should respond (not error) -- expect HTTP 501
-curl -i -X POST "<ApiBaseUrl>/datasets/upload-url"
-curl -i -X GET  "<ApiBaseUrl>/jobs/01ARZ3NDEKTSV4RRFFQ69G5FAV"
+# 1. Get a presigned upload URL and job id
+curl -s -X POST "<ApiBaseUrl>/datasets/upload-url" | tee /tmp/presign.json
+
+# 2. Upload a small CSV of Iris feature rows (no header) to the returned URL
+JOB_ID=$(jq -r .job_id /tmp/presign.json)
+UPLOAD_URL=$(jq -r .upload_url /tmp/presign.json)
+printf '5.1,3.5,1.4,0.2\n6.7,3.1,4.7,1.5\n' | curl -s -X PUT --data-binary @- "$UPLOAD_URL"
+
+# 3. Submit the job
+curl -s -X POST "<ApiBaseUrl>/jobs" -d "{\"job_id\": \"$JOB_ID\"}"
+
+# 4. Poll status, then fetch results once COMPLETED
+curl -s "<ApiBaseUrl>/jobs/$JOB_ID"
+curl -s "<ApiBaseUrl>/jobs/$JOB_ID/results"
 ```
 
-A `501` JSON body confirms API Gateway → Lambda → the shared Layer are
-wired correctly end to end. A `403`/`500` instead means something in the
-IAM or integration wiring needs investigation before Phase 3 begins.
-
-You can also start a state machine execution directly to exercise the
-orchestration path (it will run against the placeholder Lambda handlers and
-a SageMaker Model that has no real artifact yet, so `RunBatchTransformJob`
-is expected to fail there until Phase 3 -- that's fine; the goal here is to
-confirm `ValidateInput` and the `MarkProcessing` DynamoDB integration
-execute correctly first):
-
-```bash
-aws stepfunctions start-execution \
-  --state-machine-arn <StateMachineArn> \
-  --input '{"job_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "input_s3_key": "uploads/01ARZ3NDEKTSV4RRFFQ69G5FAV/input.csv"}'
-```
+Until [`scripts/package_model.sh`](../../scripts/package_model.sh) has been
+run at least once against this environment, step 3's Step Functions
+execution will reach `RunBatchTransformJob` and fail there -- the model
+artifact doesn't exist yet. Everything up to and including `ValidateInput`
+and the `MarkProcessing` DynamoDB transition should still succeed, which is
+enough to confirm the API/Lambda/Step Functions/DynamoDB wiring is correct
+before the model is in place.
 
 ## Region other than us-east-1
 
@@ -151,4 +156,4 @@ part of `sam delete`) is planned as Phase 4 tooling -- see
 | `Layer version ... is not compatible with function's architecture`   | Built without `--use-container`, or Docker wasn't running during the build. Rebuild with Docker up. |
 | `CREATE_FAILED` on `ApiAccessLogGroup`/`JobsApi` referencing CloudWatch | The [one-time account bootstrap](#one-time-per-accountregion-api-gateway-cloudwatch-role) hasn't been deployed in this account/region yet. |
 | `CREATE_FAILED` on an `AWS::IAM::Role` -- "already exists"             | A previous stack in this account used the same environment name and wasn't fully torn down; check for orphaned roles from a failed `sam delete`. |
-| `RunBatchTransformJob` fails with a 404 reading the model artifact       | Expected until Phase 3 uploads a real `model.tar.gz` -- see [ADR-0009](../adr/0009-sagemaker-model-artifact-parameterization.md). |
+| `RunBatchTransformJob` fails with a 404 reading the model artifact       | Run `scripts/package_model.sh <environment>` at least once against this environment -- see [ADR-0009](../adr/0009-sagemaker-model-artifact-parameterization.md). |

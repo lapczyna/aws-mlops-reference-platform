@@ -7,6 +7,43 @@ release corresponds to one completed phase of the [roadmap](docs/roadmap.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-06
+
+### Added -- Phase 3: Application Implementation
+
+- Domain layer: `JobId` (ULID) and `JobStatus` value objects, S3 key-layout
+  helpers, the `InferenceJob` entity with enforced lifecycle transitions,
+  a domain exception hierarchy, and four ports (`JobRepository`,
+  `DatasetStorage`, `ResultsStorage`, `JobOrchestrator`).
+- Application layer: six use cases (`PresignDatasetUpload`,
+  `SubmitBatchJob`, `GetJobStatus`, `GetJobResults`, `ValidateJobInput`,
+  `RecordJobOutcome`) and their DTOs, with dependencies injected via
+  constructor (ports, not concrete infrastructure).
+- Infrastructure adapters: `DynamoDbJobRepository`, `S3DatasetStorage`,
+  `S3ResultsStorage`, `StepFunctionsJobOrchestrator`.
+- Shared layer: typed environment-driven `Settings` (`shared/config.py`),
+  a Powertools `Logger` factory, a Powertools `Metrics` factory
+  (`BatchInferencePlatform` namespace), and a uniform API Gateway JSON
+  response helper.
+- All six Lambda handlers now contain real logic wired at the composition
+  root (cold-start client construction), replacing the Phase 2 stubs.
+- `ml/train.py` and `ml/inference.py`: trains a scikit-learn
+  `RandomForestClassifier` on Iris and packages it for the SageMaker
+  scikit-learn container's inference contract; `scripts/package_model.sh`
+  uploads the result to a deployed environment. `template.yaml`'s
+  `InferenceModel` gained the `SAGEMAKER_PROGRAM`/`SAGEMAKER_SUBMIT_DIRECTORY`
+  environment variables this requires.
+- ADR-0013: idempotent job submission via DynamoDB/Step Functions
+  conditional writes.
+- 70 tests (45 unit against in-memory port fakes, 25 integration against
+  `moto`-mocked DynamoDB/S3/Step Functions, including full handler-level
+  tests) at 97% coverage. Fixed a `pyproject.toml` linting gap where
+  `assert`-in-production-code (`S101`) was ignored repo-wide instead of
+  only in tests.
+
+Validated with `ruff`, `black`, `mypy --strict`, `pytest --cov`,
+`cfn-lint`, and `sam validate`/`sam build`.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added -- Phase 2: Infrastructure as Code

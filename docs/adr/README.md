@@ -23,6 +23,7 @@ in the log for historical context.
 | [0010](0010-optional-customer-managed-kms-key.md) | Customer-managed KMS key as an opt-in parameter        | Accepted |
 | [0011](0011-explicit-per-function-iam-roles.md) | Explicit per-function IAM roles instead of SAM auto-generated roles | Accepted |
 | [0012](0012-api-gateway-account-settings-bootstrap.md) | API Gateway account settings as a separate bootstrap stack | Accepted |
+| [0013](0013-idempotent-job-submission.md) | Idempotent job submission via conditional writes            | Accepted |
 
 Further ADRs will be added in later phases as security, CI/CD promotion, and
 operational decisions are made (e.g. alarm thresholds, dashboard design).

@@ -18,12 +18,14 @@ classifiers = [
 ]
 
 # Runtime dependencies for Lambda handlers and the shared application package.
-# Business logic lands in Phase 3 -- these are declared now so the dev
-# environment, linting and typing setup is stable from Phase 1 onward.
+# Kept in lockstep with src/requirements.txt, which is what actually gets
+# packaged into the Lambda Layer (see ADR-0007) -- boto3 is the one
+# exception, provided by the Lambda runtime itself.
 dependencies = [
     "boto3>=1.34,<2",
     "aws-lambda-powertools>=2.38,<3",
     "pydantic>=2.6,<3",
+    "python-ulid>=2,<4",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +39,15 @@ dev = [
     "pytest-mock>=3.14,<4",
     "moto[s3,dynamodb,stepfunctions,sagemaker]>=5.0,<6",
     "pre-commit>=3.7,<4",
+]
+# Local-only tooling for training and packaging the reference model (ml/).
+# Deliberately NOT in `dependencies` or src/requirements.txt: these are
+# heavy binary wheels irrelevant to the Lambda functions, and including them
+# in the Lambda Layer would bloat it for no runtime benefit.
+ml = [
+    "scikit-learn>=1.4,<2",
+    "pandas>=2.2,<3",
+    "joblib>=1.3,<2",
 ]
 
 [tool.setuptools.packages.find]
@@ -67,12 +78,13 @@ select = [
     "PT",   # flake8-pytest-style
     "RUF",  # ruff-specific rules
 ]
-ignore = [
-    "S101", # allow `assert` -- required in pytest test bodies
-]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106"]
+# ml/ scripts are standalone CLI tools (training, packaging), not Lambda
+# handlers -- print() is the correct way to report progress to a user
+# running them interactively.
+"ml/**" = ["T201"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["batch_inference_platform"]

@@ -1,25 +1,44 @@
-"""Step Functions tasks: RecordSuccess / RecordFailure -- placeholder handler.
+"""Step Functions tasks: RecordSuccess / RecordFailure -- Lambda handler.
 
-Real implementation (DynamoDB UpdateItem to a terminal status and CloudWatch
-EMF metric emission) lands in Phase 3. This stub only logs the outcome so
-the Phase 2 state machine can reach a terminal state end to end.
-
-Invoked directly by Step Functions for both the ``RecordSuccess`` and
-``RecordFailure`` states -- see ``statemachine/job_orchestration.asl.json``.
+Invoked directly by Step Functions for both terminal states in
+`statemachine/job_orchestration.asl.json`. Every reachable path in the ASL
+routes through this handler before the execution ends, so it is the one
+place a job's DynamoDB record is guaranteed to reach a terminal status.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from aws_lambda_powertools import Logger
+import boto3
 from aws_lambda_powertools.utilities.typing import LambdaContext
 
-logger = Logger(service="record-outcome")
+from batch_inference_platform.application.use_cases.record_job_outcome import RecordJobOutcome
+from batch_inference_platform.infrastructure.persistence.dynamodb_job_repository import (
+    DynamoDbJobRepository,
+)
+from batch_inference_platform.shared.config import get_settings
+from batch_inference_platform.shared.logging import get_logger
+from batch_inference_platform.shared.metrics import get_metrics
+
+logger = get_logger(service="record-outcome")
+metrics = get_metrics(service="record-outcome")
+
+_settings = get_settings()
+_job_repository = DynamoDbJobRepository(boto3.resource("dynamodb").Table(_settings.jobs_table_name))
+_use_case = RecordJobOutcome(_job_repository, metrics)
 
 
 @logger.inject_lambda_context(log_event=True)
+@metrics.log_metrics(capture_cold_start_metric=True)  # type: ignore[untyped-decorator]
 def handler(event: dict[str, Any], context: LambdaContext) -> dict[str, Any]:
     """Step Functions task entry point for the RecordSuccess/RecordFailure states."""
-    logger.info("Outcome recording stubbed until Phase 3", extra={"event": event})
+    logger.append_keys(job_id=event.get("job_id"))
+    _use_case.execute(
+        job_id_value=event["job_id"],
+        status=event["status"],
+        error_code=event.get("error_code"),
+        error_cause=event.get("error_cause"),
+    )
+    logger.info("Job outcome recorded", extra={"status": event["status"]})
     return {"acknowledged": True}

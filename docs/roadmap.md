@@ -12,7 +12,7 @@ business logic or infrastructure yet.
 
 **Status:** Complete (tagged `v0.1.0`).
 
-## Phase 2 -- Infrastructure as Code (this phase)
+## Phase 2 -- Infrastructure as Code
 
 The full AWS SAM template: API Gateway REST API, 6 Lambda functions (thin
 placeholder handlers sufficient to deploy and smoke-test the wiring), a
@@ -24,18 +24,23 @@ policies, and a one-time account-level bootstrap stack for API Gateway
 CloudWatch logging. Validated with `cfn-lint`, `sam validate --lint`, and
 `sam build`. Deployable end-to-end with placeholder application logic.
 
-**Status:** Complete.
+**Status:** Complete (tagged `v0.2.0`).
 
 ## Phase 3 -- Application Implementation
 
-Full application logic behind the infrastructure from Phase 2: REST
-endpoint handlers, dataset upload flow, job submission, state machine task
-handlers, result persistence and retrieval, structured logging,
-configuration management, validation, dependency injection at the
-composition root, unit tests, and integration tests against `moto`-mocked
-AWS services.
+Full application logic behind the Phase 2 infrastructure, built as Clean
+Architecture layers: domain entities/value objects/ports, application use
+cases and DTOs, infrastructure adapters (DynamoDB, S3, Step Functions), and
+the 6 Lambda handlers wired as composition roots. Covers dataset upload,
+idempotent job submission (ADR-0013), state machine task handlers, result
+persistence and retrieval, structured logging (Powertools), typed
+environment-driven configuration, CloudWatch EMF metrics, and the actual
+Iris `RandomForestClassifier` training/packaging script plus its SageMaker
+inference contract (`ml/train.py`, `ml/inference.py`). 70 tests (unit +
+`moto`-mocked integration, including full handler-level tests) at 97%
+coverage; `ruff`, `black`, and `mypy --strict` all clean.
 
-**Status:** Not started.
+**Status:** Complete.
 
 ## Phase 4 -- Enterprise Production Readiness
 

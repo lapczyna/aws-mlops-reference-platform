@@ -1,16 +1,14 @@
 # Tests
 
-This directory hosts the automated test suite. Test implementation begins in
-**Phase 3** alongside the application code it verifies; this scaffold exists
-now so tooling (`pytest`, coverage, CI) has a stable target from Phase 1
-onward.
+This directory hosts the automated test suite: 70 tests, 97% coverage of
+`src/batch_inference_platform` (`make test-cov`).
 
 ## Layout
 
 | Directory           | Purpose                                                                                   |
 | -------------------- | ------------------------------------------------------------------------------------------ |
-| `unit/`               | Fast, isolated tests with no I/O. Domain and application layers are tested here with plain Python -- no AWS clients, no network. |
-| `integration/`        | Tests exercising infrastructure adapters against mocked AWS services via [`moto`](https://github.com/getmoto/moto). Verifies DynamoDB item shapes, S3 interactions, and Step Functions state transitions without touching real AWS accounts. |
+| `unit/`               | Fast, isolated tests with no I/O. Domain entities/value objects and application use cases, exercised against in-memory fakes (`tests/unit/fakes.py`) for the domain ports -- no AWS clients, no network. |
+| `integration/`        | Tests exercising real infrastructure adapters and full Lambda handlers against mocked AWS services via [`moto`](https://github.com/getmoto/moto). Verifies DynamoDB item shapes, S3 interactions, Step Functions execution naming/idempotency, and the complete handler composition root (`integration/api/handlers/`) without touching real AWS accounts. |
 
 ## Conventions
 

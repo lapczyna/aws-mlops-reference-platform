@@ -6,3 +6,4 @@
 # version newer than the runtime's, pin it here explicitly at that point.
 aws-lambda-powertools>=2.38.1,<3
 pydantic>=2.6.4,<3
+python-ulid>=2,<4

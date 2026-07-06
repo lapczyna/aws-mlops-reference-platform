@@ -57,10 +57,11 @@ individual request/job flow is diagrammed in
 | API Gateway REST API, not HTTP API                       | [ADR-0006](docs/adr/0006-api-gateway-rest-api-choice.md) -- request validation, usage plans, WAF and private-endpoint support |
 | Shared code as a Lambda Layer                            | [ADR-0007](docs/adr/0007-lambda-layers-shared-code.md) -- one source of truth for domain/infrastructure code across functions |
 | Asynchronous submit-and-poll, not synchronous inference    | [ADR-0008](docs/adr/0008-asynchronous-job-processing-pattern.md) -- API Gateway's 29s integration timeout makes synchronous batch inference structurally impossible |
-| SageMaker Model/container image as deploy-time parameters   | [ADR-0009](docs/adr/0009-sagemaker-model-artifact-parameterization.md) -- lets infrastructure deploy before Phase 3 trains and uploads the real artifact |
+| SageMaker Model/container image as deploy-time parameters   | [ADR-0009](docs/adr/0009-sagemaker-model-artifact-parameterization.md) -- lets infrastructure deploy before the model is trained and uploaded |
 | Customer-managed KMS key is opt-in, not default             | [ADR-0010](docs/adr/0010-optional-customer-managed-kms-key.md) -- avoids KMS cost/complexity in `dev` while staying available for `staging`/`prod` |
 | Explicit per-function IAM roles, not SAM auto-generated       | [ADR-0011](docs/adr/0011-explicit-per-function-iam-roles.md) -- predictable role names, tighter-than-default logging permissions |
 | API Gateway account settings live in a separate bootstrap stack | [ADR-0012](docs/adr/0012-api-gateway-account-settings-bootstrap.md) -- avoids one environment's teardown clobbering an account-wide singleton |
+| Idempotent job submission via conditional writes              | [ADR-0013](docs/adr/0013-idempotent-job-submission.md) -- retrying `POST /jobs` with the same `job_id` never double-creates a job or a Step Functions execution |
 
 ## Technology stack
 
@@ -84,13 +85,13 @@ individual request/job flow is diagrammed in
 
 ```
 ├── src/batch_inference_platform/   # Application code (Clean Architecture layers)
-│   ├── api/handlers/                 # Lambda handlers (interface layer) -- placeholder stubs until Phase 3
+│   ├── api/handlers/                 # Lambda handlers (interface layer / composition roots)
 │   ├── application/                  # Use cases and DTOs
 │   ├── domain/                        # Entities, value objects, ports, exceptions
 │   ├── infrastructure/                 # AWS adapters (DynamoDB, S3, Step Functions, SageMaker)
-│   └── shared/                          # Logging, configuration, cross-cutting concerns
+│   └── shared/                          # Logging, configuration, metrics, cross-cutting concerns
 ├── src/requirements.txt              # Third-party deps packaged into the shared Lambda Layer
-├── tests/                            # Unit and integration tests (moto-mocked AWS)
+├── tests/                            # 70 tests, 97% coverage (unit + moto-mocked integration)
 ├── ml/                                # Model training script and packaging (Iris classifier)
 ├── scripts/                           # Deployment and operational helper scripts
 ├── statemachine/
@@ -125,7 +126,15 @@ approach (`moto`) are in the
 To deploy the infrastructure itself, see the
 [deployment guide](docs/guides/deployment-guide.md) for concrete steps
 (the [deployment strategy guide](docs/guides/deployment-strategy.md)
-covers the *why* behind environments and promotion).
+covers the *why* behind environments and promotion). After deploying, train
+and upload the model artifact once per environment:
+
+```bash
+pip install -e ".[ml]"
+scripts/package_model.sh dev
+```
+
+See [`ml/README.md`](ml/README.md) for details.
 
 ## Documentation
 
@@ -163,7 +172,7 @@ phase plan and what's deferred beyond it.
 | ----- | -------------------------------------------- | ------------------ |
 | 1     | Repository foundation, architecture, docs      | Complete (`v0.1.0`) |
 | 2     | Infrastructure as Code (AWS SAM)                | Complete (`v0.2.0`) |
-| 3     | Application implementation                       | Not started       |
+| 3     | Application implementation                       | Complete (`v0.3.0`) |
 | 4     | Enterprise production readiness (CI/CD, observability, security review) | Not started |
 
 ## License

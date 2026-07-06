@@ -57,6 +57,10 @@ individual request/job flow is diagrammed in
 | API Gateway REST API, not HTTP API                       | [ADR-0006](docs/adr/0006-api-gateway-rest-api-choice.md) -- request validation, usage plans, WAF and private-endpoint support |
 | Shared code as a Lambda Layer                            | [ADR-0007](docs/adr/0007-lambda-layers-shared-code.md) -- one source of truth for domain/infrastructure code across functions |
 | Asynchronous submit-and-poll, not synchronous inference    | [ADR-0008](docs/adr/0008-asynchronous-job-processing-pattern.md) -- API Gateway's 29s integration timeout makes synchronous batch inference structurally impossible |
+| SageMaker Model/container image as deploy-time parameters   | [ADR-0009](docs/adr/0009-sagemaker-model-artifact-parameterization.md) -- lets infrastructure deploy before Phase 3 trains and uploads the real artifact |
+| Customer-managed KMS key is opt-in, not default             | [ADR-0010](docs/adr/0010-optional-customer-managed-kms-key.md) -- avoids KMS cost/complexity in `dev` while staying available for `staging`/`prod` |
+| Explicit per-function IAM roles, not SAM auto-generated       | [ADR-0011](docs/adr/0011-explicit-per-function-iam-roles.md) -- predictable role names, tighter-than-default logging permissions |
+| API Gateway account settings live in a separate bootstrap stack | [ADR-0012](docs/adr/0012-api-gateway-account-settings-bootstrap.md) -- avoids one environment's teardown clobbering an account-wide singleton |
 
 ## Technology stack
 
@@ -80,21 +84,28 @@ individual request/job flow is diagrammed in
 
 ```
 ├── src/batch_inference_platform/   # Application code (Clean Architecture layers)
-│   ├── api/                          # Lambda handlers (interface layer)
+│   ├── api/handlers/                 # Lambda handlers (interface layer) -- placeholder stubs until Phase 3
 │   ├── application/                  # Use cases and DTOs
 │   ├── domain/                        # Entities, value objects, ports, exceptions
 │   ├── infrastructure/                 # AWS adapters (DynamoDB, S3, Step Functions, SageMaker)
 │   └── shared/                          # Logging, configuration, cross-cutting concerns
+├── src/requirements.txt              # Third-party deps packaged into the shared Lambda Layer
 ├── tests/                            # Unit and integration tests (moto-mocked AWS)
 ├── ml/                                # Model training script and packaging (Iris classifier)
 ├── scripts/                           # Deployment and operational helper scripts
+├── statemachine/
+│   └── job_orchestration.asl.json      # Step Functions state machine definition
+├── bootstrap/
+│   └── api-gateway-account-settings.yaml # One-time account-level CloudWatch role for API Gateway
 ├── docs/
 │   ├── architecture/                    # Overview + sequence diagrams
 │   ├── adr/                              # Architecture Decision Records
 │   ├── standards/                         # Naming conventions, coding standards
 │   ├── guides/                             # Development, deployment, cost, security guides
 │   └── roadmap.md                          # Phased delivery plan
-├── template.yaml                       # AWS SAM template (Phase 2)
+├── template.yaml                       # AWS SAM template: API Gateway, Lambda, Step Functions,
+│                                          # S3, DynamoDB, IAM, SageMaker, CloudWatch
+├── samconfig.toml                      # Per-environment (dev/staging/prod) deploy configuration
 ├── pyproject.toml                      # Project metadata, Ruff/Black/mypy/pytest config
 └── Makefile                            # Common developer commands
 ```
@@ -111,9 +122,10 @@ make test            # run the test suite
 Full setup instructions, troubleshooting, and the local AWS-mocking
 approach (`moto`) are in the
 [development environment guide](docs/guides/development-environment.md).
-Deployment instructions land with the SAM template in Phase 2; the
-deployment model itself is documented now in the
-[deployment strategy guide](docs/guides/deployment-strategy.md).
+To deploy the infrastructure itself, see the
+[deployment guide](docs/guides/deployment-guide.md) for concrete steps
+(the [deployment strategy guide](docs/guides/deployment-strategy.md)
+covers the *why* behind environments and promotion).
 
 ## Documentation
 
@@ -126,7 +138,8 @@ entry points:
 - [Naming conventions](docs/standards/naming-conventions.md) ·
   [Coding standards](docs/standards/coding-standards.md)
 - [Development environment](docs/guides/development-environment.md) ·
-  [Deployment strategy](docs/guides/deployment-strategy.md)
+  [Deployment strategy](docs/guides/deployment-strategy.md) ·
+  [Deployment guide](docs/guides/deployment-guide.md)
 - [Project roadmap](docs/roadmap.md)
 
 ## Design principles
@@ -148,8 +161,8 @@ phase plan and what's deferred beyond it.
 
 | Phase | Scope                                     | Status         |
 | ----- | -------------------------------------------- | ------------------ |
-| 1     | Repository foundation, architecture, docs      | In progress       |
-| 2     | Infrastructure as Code (AWS SAM)                | Not started       |
+| 1     | Repository foundation, architecture, docs      | Complete (`v0.1.0`) |
+| 2     | Infrastructure as Code (AWS SAM)                | Complete (`v0.2.0`) |
 | 3     | Application implementation                       | Not started       |
 | 4     | Enterprise production readiness (CI/CD, observability, security review) | Not started |
 

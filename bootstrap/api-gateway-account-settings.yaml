@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One-time, account+region-wide prerequisite for API Gateway CloudWatch
+  Logs integration (execution logs and access logs). API Gateway REST APIs
+  cannot deliver logs to CloudWatch until this account-level setting points
+  at an IAM role it can assume.
+
+  This is deliberately NOT part of the main application stack
+  (template.yaml): AWS::ApiGateway::Account is a singleton per account and
+  region, not scoped to a single stack. Managing it inside a per-environment
+  stack risks a later `sam delete` of a dev/staging stack silently reverting
+  or deleting the account-wide setting and breaking logging for every other
+  API Gateway in the account. Deploy this stack once per account/region,
+  independently of and before the environment stacks in template.yaml.
+
+  Safe to skip if this account already has an API Gateway CloudWatch role
+  configured (Settings > Logs in the API Gateway console will show it).
+
+Resources:
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: apigateway-cloudwatch-logs-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: apigateway.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+Outputs:
+  ApiGatewayCloudWatchRoleArn:
+    Description: Role ARN registered as the account-level API Gateway CloudWatch Logs role.
+    Value: !GetAtt ApiGatewayCloudWatchRole.Arn

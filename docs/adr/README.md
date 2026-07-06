@@ -19,7 +19,10 @@ in the log for historical context.
 | [0006](0006-api-gateway-rest-api-choice.md) | API Gateway REST API over HTTP API                     | Accepted |
 | [0007](0007-lambda-layers-shared-code.md) | Lambda Layer for shared application code                 | Accepted |
 | [0008](0008-asynchronous-job-processing-pattern.md) | Asynchronous submit-and-poll job processing   | Accepted |
+| [0009](0009-sagemaker-model-artifact-parameterization.md) | SageMaker Model and container image as deploy-time parameters | Accepted |
+| [0010](0010-optional-customer-managed-kms-key.md) | Customer-managed KMS key as an opt-in parameter        | Accepted |
+| [0011](0011-explicit-per-function-iam-roles.md) | Explicit per-function IAM roles instead of SAM auto-generated roles | Accepted |
+| [0012](0012-api-gateway-account-settings-bootstrap.md) | API Gateway account settings as a separate bootstrap stack | Accepted |
 
-Further ADRs will be added in later phases as infrastructure, security, and
-operational decisions are made (e.g. encryption key strategy, CI/CD
-promotion strategy, alarm thresholds).
+Further ADRs will be added in later phases as security, CI/CD promotion, and
+operational decisions are made (e.g. alarm thresholds, dashboard design).

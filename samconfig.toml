@@ -1,0 +1,47 @@
+version = 0.1
+
+# Shared defaults inherited by every named environment below unless overridden.
+[default.build.parameters]
+use_container = true
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+resolve_s3 = true
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+tags = "Project=\"batch-inference-platform\" ManagedBy=\"aws-sam\" Owner=\"platform-team\""
+
+# --- dev: individual developer / feature validation (see docs/guides/deployment-strategy.md) ---
+[dev.deploy.parameters]
+stack_name = "batch-inference-dev"
+s3_prefix = "batch-inference-dev"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"dev\" LogLevel=\"DEBUG\" LogRetentionInDays=14 DatasetRetentionDays=7 ResultsRetentionDays=7"
+tags = "Project=\"batch-inference-platform\" Environment=\"dev\" ManagedBy=\"aws-sam\" Owner=\"platform-team\""
+
+# --- staging: CI auto-deploy on merge to main ---
+[staging.deploy.parameters]
+stack_name = "batch-inference-staging"
+s3_prefix = "batch-inference-staging"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"staging\" LogLevel=\"INFO\" LogRetentionInDays=90 DatasetRetentionDays=30 ResultsRetentionDays=30"
+tags = "Project=\"batch-inference-platform\" Environment=\"staging\" ManagedBy=\"aws-sam\" Owner=\"platform-team\""
+
+# --- prod: CI deploy on tagged release, behind a manual approval gate ---
+[prod.deploy.parameters]
+stack_name = "batch-inference-prod"
+s3_prefix = "batch-inference-prod"
+region = "us-east-1"
+confirm_changeset = false
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "Environment=\"prod\" LogLevel=\"INFO\" LogRetentionInDays=365 DatasetRetentionDays=30 ResultsRetentionDays=90 StateMachineLogLevel=\"ERROR\" DatasetUploadCorsOrigin=\"https://app.example.com\""
+tags = "Project=\"batch-inference-platform\" Environment=\"prod\" ManagedBy=\"aws-sam\" Owner=\"platform-team\""

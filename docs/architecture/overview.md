@@ -108,32 +108,40 @@ under its timeout regardless of dataset size or model runtime.
 ```mermaid
 flowchart LR
     start([Start Execution]) --> validate["ValidateInput\n(Lambda)"]
-    validate -->|valid| markProcessing["MarkJobProcessing\n(DynamoDB PutItem,\ndirect SDK integration)"]
-    validate -->|invalid| failFast["MarkJobFailed:\nInvalidInput\n(Lambda)"]
+    validate --> checkValid{"CheckInputValid\n(Choice)"}
+    checkValid -->|valid| markProcessing["MarkProcessing\n(DynamoDB UpdateItem,\ndirect SDK integration)"]
+    checkValid -->|invalid| tagInvalid["TagInvalidInput\n(Pass)"]
     markProcessing --> transform["RunBatchTransformJob\n(SageMaker, .sync integration)"]
-    transform -->|success| markCompleted["MarkJobCompleted\n(Lambda)"]
-    transform -->|SageMaker error| markFailed["MarkJobFailed:\nTransformError\n(Lambda)"]
-    markCompleted --> notify["EmitCompletionMetric\n(CloudWatch EMF)"]
-    markFailed --> notifyFail["EmitFailureMetric +\nCloudWatch Alarm"]
-    failFast --> notifyFail
-    notify --> done([End])
-    notifyFail --> done
+    transform -->|success| recordSuccess["RecordSuccess\n(Lambda)"]
+    transform -->|SageMaker error| recordFailure["RecordFailure\n(Lambda)"]
+    tagInvalid --> recordFailure
+    recordSuccess --> done([End])
+    recordFailure --> jobFailed(["JobFailed\n(Fail state)"])
 ```
+
+Every path -- valid, invalid, or a failed transform job -- reaches exactly
+one of two Lambda-backed terminal states, `RecordSuccess` or `RecordFailure`,
+so no execution can end without a corresponding DynamoDB status write and
+CloudWatch EMF metric. The exact ASL is in
+[`statemachine/job_orchestration.asl.json`](../../statemachine/job_orchestration.asl.json).
 
 ## Step Functions state machine (logical states)
 
 ```mermaid
 stateDiagram-v2
     [*] --> ValidateInput
-    ValidateInput --> MarkProcessing: input valid
-    ValidateInput --> MarkFailed: input invalid
-    MarkProcessing --> RunBatchTransform
-    RunBatchTransform --> MarkCompleted: transform job SUCCEEDED
-    RunBatchTransform --> MarkFailed: transform job FAILED / timed out
-    MarkCompleted --> [*]
-    MarkFailed --> [*]
+    ValidateInput --> CheckInputValid
+    CheckInputValid --> MarkProcessing: valid
+    CheckInputValid --> TagInvalidInput: invalid
+    MarkProcessing --> RunBatchTransformJob
+    RunBatchTransformJob --> RecordSuccess: transform job SUCCEEDED
+    RunBatchTransformJob --> RecordFailure: transform job FAILED / timed out
+    TagInvalidInput --> RecordFailure
+    RecordSuccess --> [*]
+    RecordFailure --> JobFailed
+    JobFailed --> [*]
 
-    note right of RunBatchTransform
+    note right of RunBatchTransformJob
         Optimized (.sync) integration:
         arn:aws:states:::sagemaker:createTransformJob.sync
         Step Functions polls SageMaker natively --
@@ -141,7 +149,9 @@ stateDiagram-v2
     end note
 ```
 
-This ASL definition ships as part of the SAM template in **Phase 2**.
+This ASL definition ships as `statemachine/job_orchestration.asl.json` as of
+**Phase 2** (infrastructure only -- `ValidateInput` and `RecordSuccess`/
+`RecordFailure` are placeholder Lambda handlers until Phase 3).
 
 ## Data model summary
 
@@ -167,15 +177,23 @@ Rationale for a single table with no GSIs in the initial design is captured in
 
 ```
 s3://<datasets-bucket>/uploads/{job_id}/input.csv
-s3://<results-bucket>/predictions/{job_id}/output.csv.out
+s3://<results-bucket>/predictions/{job_id}/input.csv.out
+s3://<model-artifacts-bucket>/model/model.tar.gz
 ```
 
-Both buckets are versioned, encrypted with SSE-S3 (default) or SSE-KMS
-(configurable), block all public access, and enforce TLS-only access via
-bucket policy. Lifecycle rules expire objects after a configurable retention
-window (default 30 days) to bound storage cost.
+A third bucket, for the packaged SageMaker model artifact, was added when
+Phase 2 implemented the infrastructure -- model artifacts have a distinct
+lifecycle (long-lived, versioned by model release) from transient job I/O,
+so they don't belong in the datasets or results buckets. All three buckets
+are versioned, encrypted with SSE-S3 (default) or SSE-KMS
+(configurable via [ADR-0010](../adr/0010-optional-customer-managed-kms-key.md)),
+block all public access, and enforce TLS-only access via bucket policy.
+Lifecycle rules expire objects in the datasets and results buckets after a
+configurable retention window (defaults: 7 and 30 days respectively) to
+bound storage cost; the model artifacts bucket has no expiration on current
+versions, only a bound on how many noncurrent (superseded) versions persist.
 
-## API surface (contract, implemented in Phase 3)
+## API surface (contract; infrastructure deployed in Phase 2, behavior implemented in Phase 3)
 
 | Method | Path                    | Purpose                                                  |
 | ------ | ------------------------ | ----------------------------------------------------------- |
@@ -214,5 +232,8 @@ reaches Lambda. See [ADR-0006](../adr/0006-api-gateway-rest-api-choice.md).
 - [Sequence diagrams](sequence-diagrams.md)
 - [ADR log](../adr/README.md)
 - [Naming conventions](../standards/naming-conventions.md)
-- [Deployment strategy](../guides/deployment-strategy.md)
+- [Deployment strategy](../guides/deployment-strategy.md) ·
+  [Deployment guide](../guides/deployment-guide.md)
 - [Project roadmap](../roadmap.md)
+- [`template.yaml`](../../template.yaml) ·
+  [`statemachine/job_orchestration.asl.json`](../../statemachine/job_orchestration.asl.json)

@@ -9,6 +9,7 @@
 |                       | [Coding standards](standards/coding-standards.md) -- typing, layering, SOLID, testing, security review checklist |
 | **Guides**             | [Development environment](guides/development-environment.md) -- local setup, tooling, testing |
 |                       | [Deployment strategy](guides/deployment-strategy.md) -- environments, promotion flow, IaC approach |
+|                       | [Deployment guide](guides/deployment-guide.md) -- concrete `sam build`/`deploy` steps, verification, teardown |
 |                       | [Cost guide](guides/cost-guide.md) -- planned for Phase 4 |
 |                       | [Security guide](guides/security-guide.md) -- planned for Phase 4 |
 | **Runbooks**           | Planned for Phase 4 (`runbooks/`) |

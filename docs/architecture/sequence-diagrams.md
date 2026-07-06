@@ -67,26 +67,29 @@ sequenceDiagram
     participant SM as SageMaker Batch Transform
     participant S3in as S3 (Datasets Bucket)
     participant S3out as S3 (Results Bucket)
+    participant Outcome as RecordOutcome Lambda
     participant CW as CloudWatch
 
     SFN->>Validate: invoke({job_id, input_s3_key})
     Validate->>S3in: head_object(input_s3_key)
     alt dataset missing or malformed
-        Validate-->>SFN: raise InvalidInputError
-        SFN->>DDB: UpdateItem(status=FAILED, error_message)
-        SFN->>CW: EmitFailureMetric(reason=InvalidInput)
+        Validate-->>SFN: {valid: false, reason}
+        SFN->>Outcome: invoke({job_id, status: FAILED, error_code: InvalidInput})
+        Outcome->>DDB: UpdateItem(status=FAILED, error_message)
+        Outcome->>CW: EmitFailureMetric(reason=InvalidInput) [EMF]
     else dataset valid
         Validate-->>SFN: {valid: true}
-        SFN->>DDB: PutItem(status=PROCESSING) [direct SDK integration]
+        SFN->>DDB: UpdateItem(status=PROCESSING) [direct SDK integration]
         SFN->>SM: CreateTransformJob(.sync) {ModelName, input_s3_key, S3out prefix}
         activate SM
         SM->>S3in: read dataset
         SM->>SM: run inference (Iris classifier)
-        SM->>S3out: write predictions (output.csv.out)
+        SM->>S3out: write predictions (input.csv.out)
         SM-->>SFN: TransformJobStatus = Completed
         deactivate SM
-        SFN->>DDB: UpdateItem(status=COMPLETED, output_s3_key, updated_at)
-        SFN->>CW: EmitSuccessMetric(duration)
+        SFN->>Outcome: invoke({job_id, status: COMPLETED})
+        Outcome->>DDB: UpdateItem(status=COMPLETED, output_s3_key, updated_at)
+        Outcome->>CW: EmitSuccessMetric(duration) [EMF]
     end
 ```
 
@@ -151,14 +154,17 @@ sequenceDiagram
     autonumber
     participant SFN as Step Functions
     participant SM as SageMaker Batch Transform
+    participant Outcome as RecordOutcome Lambda
     participant DDB as DynamoDB (Jobs Table)
     participant CW as CloudWatch
 
     SFN->>SM: CreateTransformJob(.sync)
     SM--xSFN: TransformJobStatus = Failed (e.g. malformed record, capacity error)
-    Note over SFN: Catch block matches States.TaskFailed
-    SFN->>DDB: UpdateItem(status=FAILED, error_message=cause)
-    SFN->>CW: PutMetricData(JobFailed=1) + structured error log
+    Note over SFN: Catch block (States.ALL) routes to RecordFailure with $.error captured
+    SFN->>Outcome: invoke({job_id, status: FAILED, error_code, error_cause})
+    Outcome->>DDB: UpdateItem(status=FAILED, error_message=cause)
+    Outcome->>CW: PutMetricData(JobFailed=1) [EMF] + structured error log
+    SFN->>SFN: transition to JobFailed (Fail state)
     CW->>CW: Alarm evaluates failure-rate metric
     Note over CW: Phase 4 wires this alarm to an SNS topic for on-call notification
 ```

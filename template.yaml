@@ -1,0 +1,914 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Batch Inference Platform -- serverless batch ML inference on AWS.
+  Phase 2: infrastructure only. Lambda handlers are thin placeholder stubs
+  replaced with real business logic in Phase 3. See docs/architecture/overview.md.
+
+# -----------------------------------------------------------------------------
+# Parameters
+# -----------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment. Drives resource naming, retention, and prod-only safety controls.
+
+  LogLevel:
+    Type: String
+    AllowedValues: [DEBUG, INFO, WARN, ERROR]
+    Default: INFO
+    Description: Application log level for Lambda functions (Powertools logger and Lambda Advanced Logging Controls).
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: CloudWatch Logs retention for every log group this stack creates.
+
+  DatasetRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Days before uploaded datasets expire from the datasets bucket.
+
+  ResultsRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days before prediction outputs expire from the results bucket.
+
+  JobTtlDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: >-
+      Days before a job's DynamoDB record expires via TTL. Consumed by the
+      SubmitJob function (Phase 3) as the JOB_TTL_DAYS environment variable;
+      wired through now so the parameter surface is stable across phases.
+
+  TransformInstanceType:
+    Type: String
+    Default: ml.m5.large
+    Description: SageMaker Batch Transform instance type.
+
+  TransformInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of instances for each SageMaker Batch Transform job.
+
+  SklearnContainerImage:
+    Type: String
+    Default: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3
+    Description: >-
+      SageMaker prebuilt scikit-learn inference container URI. The account ID
+      in this ECR path is region-specific -- the default targets us-east-1.
+      For other regions, look up the correct URI via the SageMaker Python SDK
+      (sagemaker.image_uris.retrieve("sklearn", region, version="1.2-1")) or
+      the AWS documentation's "Docker Registry Paths" page, and override this
+      parameter. See ADR-0009.
+
+  ModelArtifactS3Key:
+    Type: String
+    Default: model/model.tar.gz
+    Description: >-
+      Key of the packaged model artifact within the model artifacts bucket.
+      The artifact itself is trained and uploaded in Phase 3 (see ml/); this
+      resource can be created ahead of that because SageMaker's CreateModel
+      API only registers metadata and does not eagerly validate the artifact.
+      See ADR-0009.
+
+  EnableCustomerManagedKey:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: >-
+      When true, S3 buckets and the DynamoDB table are encrypted with a
+      customer-managed KMS key created by this stack instead of the default
+      AWS-owned key. See ADR-0010.
+
+  DatasetUploadCorsOrigin:
+    Type: String
+    Default: "*"
+    Description: >-
+      Origin allowed to upload datasets directly to S3 and call the REST API
+      from a browser. Restrict to a specific origin outside of dev.
+
+  StateMachineLogLevel:
+    Type: String
+    AllowedValues: [ALL, ERROR, FATAL, OFF]
+    Default: ERROR
+    Description: Step Functions execution logging verbosity. ALL is useful for debugging but increases log volume/cost.
+
+# -----------------------------------------------------------------------------
+# Conditions
+# -----------------------------------------------------------------------------
+Conditions:
+  UseCustomerManagedKey: !Equals [!Ref EnableCustomerManagedKey, 'true']
+  IsProd: !Equals [!Ref Environment, prod]
+
+# -----------------------------------------------------------------------------
+# Globals
+# -----------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64] # Graviton: better price/performance than x86_64 for these I/O-bound handlers
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_LOG_LEVEL: !Ref LogLevel
+        POWERTOOLS_LOGGER_LOG_EVENT: 'false'
+        JOBS_TABLE_NAME: !Ref JobsTable
+        DATASETS_BUCKET_NAME: !Ref DatasetsBucket
+        RESULTS_BUCKET_NAME: !Ref ResultsBucket
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: !Ref LogLevel
+      SystemLogLevel: WARN
+
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
+Resources:
+
+  # --- Encryption -------------------------------------------------------------
+
+  InferenceDataKey:
+    Type: AWS::KMS::Key
+    Condition: UseCustomerManagedKey
+    Properties:
+      Description: !Sub 'Customer-managed key for batch-inference-${Environment} data at rest (S3, DynamoDB)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountRootFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowServicesToUseKeyForDataAtRest
+            Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+                - dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  InferenceDataKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: UseCustomerManagedKey
+    Properties:
+      AliasName: !Sub 'alias/batch-inference-${Environment}-data'
+      TargetKeyId: !Ref InferenceDataKey
+
+  # --- Storage: S3 buckets -----------------------------------------------------
+
+  DatasetsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'batch-inference-${Environment}-datasets-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomerManagedKey, 'aws:kms', AES256]
+              KMSMasterKeyID: !If [UseCustomerManagedKey, !Ref InferenceDataKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseCustomerManagedKey, true, !Ref 'AWS::NoValue']
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDatasets
+            Status: Enabled
+            ExpirationInDays: !Ref DatasetRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref DatasetRetentionDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT]
+            AllowedOrigins: [!Ref DatasetUploadCorsOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  DatasetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DatasetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DatasetsBucket.Arn
+              - !Sub '${DatasetsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'batch-inference-${Environment}-results-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomerManagedKey, 'aws:kms', AES256]
+              KMSMasterKeyID: !If [UseCustomerManagedKey, !Ref InferenceDataKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseCustomerManagedKey, true, !Ref 'AWS::NoValue']
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: !Ref ResultsRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref ResultsRetentionDays
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ResultsBucket.Arn
+              - !Sub '${ResultsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  ModelArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'batch-inference-${Environment}-model-artifacts-${AWS::AccountId}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomerManagedKey, 'aws:kms', AES256]
+              KMSMasterKeyID: !If [UseCustomerManagedKey, !Ref InferenceDataKey, !Ref 'AWS::NoValue']
+            BucketKeyEnabled: !If [UseCustomerManagedKey, true, !Ref 'AWS::NoValue']
+      LifecycleConfiguration:
+        Rules:
+          - Id: BoundNoncurrentModelVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+
+  ModelArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ModelArtifactsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ModelArtifactsBucket.Arn
+              - !Sub '${ModelArtifactsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # --- Job state: DynamoDB ------------------------------------------------------
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'batch-inference-${Environment}-table-jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      SSESpecification:
+        SSEEnabled: !If [UseCustomerManagedKey, true, false]
+        SSEType: !If [UseCustomerManagedKey, KMS, !Ref 'AWS::NoValue']
+        KMSMasterKeyId: !If [UseCustomerManagedKey, !Ref InferenceDataKey, !Ref 'AWS::NoValue']
+
+  # --- Shared Lambda Layer (ADR-0007) --------------------------------------------
+
+  SharedDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'batch-inference-${Environment}-shared-layer'
+      Description: Domain/application/infrastructure code plus third-party runtime dependencies.
+      ContentUri: src/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [arm64]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: python3.12
+
+  # --- API Gateway ----------------------------------------------------------------
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/batch-inference-${Environment}-api-access'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  JobsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'batch-inference-${Environment}-api'
+      StageName: !Ref Environment
+      TracingEnabled: true
+      # NOTE: execution/access logging requires the account-level API Gateway
+      # CloudWatch Logs role to be configured once per account/region -- see
+      # bootstrap/api-gateway-account-settings.yaml and the deployment guide.
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+          MetricsEnabled: true
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status",
+          "responseLength":"$context.responseLength","integrationErrorMessage":"$context.integrationErrorMessage"}
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: !Sub "'${DatasetUploadCorsOrigin}'"
+      Models:
+        SubmitJobRequest:
+          type: object
+          properties:
+            job_id:
+              type: string
+              pattern: '^[0-9A-HJKMNP-TV-Z]{26}$'
+          required: [job_id]
+          additionalProperties: false
+
+  # --- Lambda functions: API handlers ----------------------------------------------
+
+  PresignUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-presign-upload'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: presign_upload.handler
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt PresignUploadFunctionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /datasets/upload-url
+            Method: POST
+
+  PresignUploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-presign-upload'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  PresignUploadFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-presign-upload'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PresignUploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt PresignUploadLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: GeneratePresignedPutUrl
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${DatasetsBucket.Arn}/uploads/*'
+
+  SubmitJobFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-submit-job'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: submit_job.handler
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt SubmitJobFunctionRole.Arn
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref JobOrchestrationStateMachine
+          JOB_TTL_DAYS: !Ref JobTtlDays
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs
+            Method: POST
+            RequestModel:
+              Model: SubmitJobRequest
+              Required: true
+
+  SubmitJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-submit-job'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  SubmitJobFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-submit-job'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SubmitJobPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt SubmitJobLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: CheckDatasetExists
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DatasetsBucket.Arn}/uploads/*'
+              - Sid: CreateJobRecord
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt JobsTable.Arn
+              - Sid: StartOrchestration
+                Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref JobOrchestrationStateMachine
+
+  GetJobStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-get-job-status'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: get_job_status.handler
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt GetJobStatusFunctionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{jobId}
+            Method: GET
+
+  GetJobStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-get-job-status'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  GetJobStatusFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-get-job-status'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetJobStatusPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt GetJobStatusLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: ReadJobRecord
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt JobsTable.Arn
+
+  GetJobResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-get-job-results'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: get_job_results.handler
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt GetJobResultsFunctionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{jobId}/results
+            Method: GET
+
+  GetJobResultsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-get-job-results'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  GetJobResultsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-get-job-results'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetJobResultsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt GetJobResultsLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: ReadJobRecord
+                Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt JobsTable.Arn
+              - Sid: GeneratePresignedGetUrl
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ResultsBucket.Arn}/predictions/*'
+
+  # --- Lambda functions: Step Functions task handlers -------------------------------
+
+  ValidateInputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-validate-input'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: validate_input.handler
+      Timeout: 30
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt ValidateInputFunctionRole.Arn
+
+  ValidateInputLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-validate-input'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  ValidateInputFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-validate-input'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ValidateInputPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt ValidateInputLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: CheckDatasetExists
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DatasetsBucket.Arn}/uploads/*'
+
+  RecordOutcomeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'batch-inference-${Environment}-fn-record-outcome'
+      CodeUri: src/batch_inference_platform/api/handlers/
+      Handler: record_outcome.handler
+      Layers: [!Ref SharedDependenciesLayer]
+      Role: !GetAtt RecordOutcomeFunctionRole.Arn
+
+  RecordOutcomeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/batch-inference-${Environment}-fn-record-outcome'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  RecordOutcomeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-fn-record-outcome'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RecordOutcomePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogGroup
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt RecordOutcomeLogGroup.Arn
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+              - Sid: UpdateJobRecord
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+              - Sid: EmitCustomMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': BatchInferencePlatform
+
+  # --- SageMaker: model + execution role -----------------------------------------
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-sagemaker-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BatchTransformDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadInputDataset
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${DatasetsBucket.Arn}/uploads/*'
+              - Sid: ReadModelArtifact
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ModelArtifactsBucket.Arn}/*'
+              - Sid: WritePredictions
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ResultsBucket.Arn}/predictions/*'
+              - Sid: WriteTransformJobLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/TransformJobs*'
+
+  InferenceModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: !Sub 'batch-inference-${Environment}-iris-classifier'
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      PrimaryContainer:
+        Image: !Ref SklearnContainerImage
+        ModelDataUrl: !Sub 's3://${ModelArtifactsBucket}/${ModelArtifactS3Key}'
+
+  # --- Step Functions ---------------------------------------------------------------
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/batch-inference-${Environment}-sm-job-orchestration'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'batch-inference-${Environment}-role-sm-orchestration'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: JobOrchestrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeOrchestrationTasks
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ValidateInputFunction.Arn
+                  - !GetAtt RecordOutcomeFunction.Arn
+              - Sid: TransitionJobToProcessing
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+              - Sid: RunBatchTransform
+                Effect: Allow
+                Action:
+                  - sagemaker:CreateTransformJob
+                  - sagemaker:DescribeTransformJob
+                  - sagemaker:StopTransformJob
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:transform-job/*'
+              - Sid: PassSageMakerExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    'iam:PassedToService': sagemaker.amazonaws.com
+              # Required for the SageMaker .sync service integration, which
+              # relies on a managed EventBridge rule to observe job completion.
+              # This exact resource ARN is documented by AWS for this pattern.
+              - Sid: ManageSyncIntegrationEventRule
+                Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventForSageMakerTransformJobRule'
+              # CloudWatch Logs "vended logs" delivery management for Step
+              # Functions does not support resource-level scoping -- this is
+              # AWS's own documented policy shape for state machine logging.
+              - Sid: ManageExecutionLogDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Sid: WriteXRayTraces
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+
+  JobOrchestrationStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'batch-inference-${Environment}-sm-job-orchestration'
+      Type: STANDARD
+      DefinitionUri: statemachine/job_orchestration.asl.json
+      DefinitionSubstitutions:
+        ValidateInputFunctionArn: !GetAtt ValidateInputFunction.Arn
+        RecordOutcomeFunctionArn: !GetAtt RecordOutcomeFunction.Arn
+        JobsTableName: !Ref JobsTable
+        ModelName: !Ref InferenceModel
+        DatasetsBucketName: !Ref DatasetsBucket
+        ResultsBucketName: !Ref ResultsBucket
+        TransformInstanceType: !Ref TransformInstanceType
+        TransformInstanceCount: !Ref TransformInstanceCount
+      Role: !GetAtt StateMachineExecutionRole.Arn
+      Tracing:
+        Enabled: true
+      Logging:
+        Level: !Ref StateMachineLogLevel
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+
+# -----------------------------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the REST API for this environment.
+    Value: !Sub 'https://${JobsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+
+  DatasetsBucketName:
+    Description: S3 bucket for uploaded datasets.
+    Value: !Ref DatasetsBucket
+
+  ResultsBucketName:
+    Description: S3 bucket for prediction outputs.
+    Value: !Ref ResultsBucket
+
+  ModelArtifactsBucketName:
+    Description: S3 bucket holding the packaged SageMaker model artifact.
+    Value: !Ref ModelArtifactsBucket
+
+  JobsTableName:
+    Description: DynamoDB table storing job state.
+    Value: !Ref JobsTable
+
+  StateMachineArn:
+    Description: ARN of the job orchestration state machine.
+    Value: !Ref JobOrchestrationStateMachine
+
+  SharedLayerArn:
+    Description: ARN of the shared dependencies Lambda Layer version.
+    Value: !Ref SharedDependenciesLayer
+
+  ModelName:
+    Description: Name of the registered SageMaker Model used by Batch Transform.
+    Value: !Ref InferenceModel

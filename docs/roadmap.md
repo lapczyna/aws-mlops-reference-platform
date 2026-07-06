@@ -4,23 +4,27 @@ This platform is built incrementally, one merge-able phase at a time. Each
 phase leaves the repository in a fully functional, reviewable state; there
 is no phase that depends on a future phase to "make sense."
 
-## Phase 1 -- Repository Foundation (this phase)
+## Phase 1 -- Repository Foundation
 
 Directory structure, architecture and sequence diagrams, ADR log, coding
 and naming standards, development environment, and this roadmap. No
 business logic or infrastructure yet.
 
-**Status:** In progress.
+**Status:** Complete (tagged `v0.1.0`).
 
-## Phase 2 -- Infrastructure as Code
+## Phase 2 -- Infrastructure as Code (this phase)
 
-The full AWS SAM template: API Gateway REST API, Lambda functions (empty
-handlers or thin stubs sufficient to deploy), Step Functions state machine,
-S3 buckets, DynamoDB table, IAM roles, CloudWatch log groups, parameters,
-outputs, tagging, encryption, and lifecycle policies. Deployable end-to-end
-with placeholder application logic.
+The full AWS SAM template: API Gateway REST API, 6 Lambda functions (thin
+placeholder handlers sufficient to deploy and smoke-test the wiring), a
+Step Functions state machine (real ASL, driving a SageMaker Batch Transform
+job via the `.sync` integration), 3 S3 buckets, a DynamoDB table, 8
+explicit least-privilege IAM roles, CloudWatch log groups, parameters,
+outputs, encryption (default + opt-in customer-managed KMS), lifecycle
+policies, and a one-time account-level bootstrap stack for API Gateway
+CloudWatch logging. Validated with `cfn-lint`, `sam validate --lint`, and
+`sam build`. Deployable end-to-end with placeholder application logic.
 
-**Status:** Not started.
+**Status:** Complete.
 
 ## Phase 3 -- Application Implementation
 

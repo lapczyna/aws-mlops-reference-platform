@@ -1,0 +1,186 @@
+{
+  "Comment": "Batch inference job orchestration: validate input, run SageMaker Batch Transform, record the outcome. Every path ends in a terminal DynamoDB status write -- no execution can leave a job stuck in PROCESSING.",
+  "StartAt": "ValidateInput",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "ValidateInput": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidateInputFunctionArn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "input_s3_key.$": "$.input_s3_key"
+        }
+      },
+      "ResultSelector": {
+        "valid.$": "$.Payload.valid",
+        "reason.$": "$.Payload.reason"
+      },
+      "ResultPath": "$.validation",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "CheckInputValid"
+    },
+    "CheckInputValid": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validation.valid",
+          "BooleanEquals": true,
+          "Next": "MarkProcessing"
+        }
+      ],
+      "Default": "TagInvalidInput"
+    },
+    "TagInvalidInput": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "InvalidInput",
+        "Cause.$": "$.validation.reason"
+      },
+      "ResultPath": "$.error",
+      "Next": "RecordFailure"
+    },
+    "MarkProcessing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${JobsTableName}",
+        "Key": {
+          "job_id": { "S.$": "$.job_id" }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updated_at",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": { "S": "PROCESSING" },
+          ":updated_at": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "RunBatchTransformJob"
+    },
+    "RunBatchTransformJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createTransformJob.sync",
+      "Parameters": {
+        "TransformJobName.$": "$.job_id",
+        "ModelName": "${ModelName}",
+        "TransformInput": {
+          "DataSource": {
+            "S3DataSource": {
+              "S3DataType": "S3Prefix",
+              "S3Uri.$": "States.Format('s3://${DatasetsBucketName}/{}', $.input_s3_key)"
+            }
+          },
+          "ContentType": "text/csv",
+          "SplitType": "Line"
+        },
+        "TransformOutput": {
+          "S3OutputPath.$": "States.Format('s3://${ResultsBucketName}/predictions/{}/', $.job_id)",
+          "AssembleWith": "Line",
+          "Accept": "text/csv"
+        },
+        "TransformResources": {
+          "InstanceType": "${TransformInstanceType}",
+          "InstanceCount": ${TransformInstanceCount}
+        }
+      },
+      "ResultPath": "$.transform",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "RecordFailure"
+        }
+      ],
+      "Next": "RecordSuccess"
+    },
+    "RecordSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RecordOutcomeFunctionArn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "COMPLETED"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    },
+    "RecordFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${RecordOutcomeFunctionArn}",
+        "Payload": {
+          "job_id.$": "$.job_id",
+          "status": "FAILED",
+          "error_code.$": "$.error.Error",
+          "error_cause.$": "$.error.Cause"
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "JobFailed"
+    },
+    "JobFailed": {
+      "Type": "Fail",
+      "Comment": "Terminal failure -- the job's DynamoDB record is already marked FAILED by RecordFailure before this state is reached.",
+      "Error": "BatchInferenceJobFailed"
+    }
+  }
+}

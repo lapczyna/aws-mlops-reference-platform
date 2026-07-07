@@ -59,6 +59,14 @@ jobs:
         with:
           use-installer: true
 
+      # See ci.yml's infrastructure job for why this is required: Lambda
+      # functions build for arm64, this runner is x86_64, and without QEMU
+      # emulation registered `sam build --use-container` hangs rather than
+      # failing outright.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: sam build
         run: sam build --use-container
 

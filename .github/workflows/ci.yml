@@ -78,6 +78,17 @@ jobs:
       - name: sam validate --lint
         run: sam validate --lint
 
+      # Lambda functions build for arm64 (see template.yaml Globals), but this
+      # runner is x86_64. `sam build --use-container` needs to run an arm64
+      # build container, which requires QEMU emulation registered -- without
+      # this step the build silently hangs (observed: 35+ minutes with no
+      # progress) rather than failing outright, most likely while pip tries
+      # to compile pydantic-core's Rust extension from source under
+      # emulation instead of fetching a prebuilt wheel.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: sam build
         run: sam build --use-container
 

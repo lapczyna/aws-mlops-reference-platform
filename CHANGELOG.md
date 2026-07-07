@@ -7,6 +7,45 @@ release corresponds to one completed phase of the [roadmap](docs/roadmap.md).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-06
+
+### Added -- Phase 4: Enterprise Production Readiness
+
+- `.github/workflows/ci.yml`: lint, typecheck, test (with coverage gate),
+  `pip-audit` dependency scan, cfn-lint/sam validate/sam build, and a model
+  train+inference-contract smoke test, on every PR and push to `main`.
+- `.github/workflows/deploy-staging.yml` (auto-deploy on CI success on
+  `main`) and `deploy-prod.yml` (deploy on `v*.*.*` tag, behind a `prod`
+  GitHub Environment gate) -- both authenticate via short-lived OIDC
+  credentials, no AWS access keys stored anywhere.
+- `bootstrap/github-oidc-deploy-role.yaml`: the one-time account-level
+  OIDC provider + deploy role this requires.
+- `template.yaml`: a CloudWatch dashboard, 6 alarms (API 5xx, aggregate
+  Lambda errors, Step Functions failures, DynamoDB throttles, business-level
+  job failure rate) and an SNS notification topic with an optional email
+  subscription.
+- `docs/guides/security-guide.md` (filled in) and `docs/security/threat-model.md`
+  (new): a STRIDE walkthrough per trust boundary, including named,
+  un-mitigated gaps rather than only listing controls.
+- `docs/guides/cost-guide.md` (filled in) and `scripts/estimate_cost.py`:
+  worked monthly estimates at three volume tiers, confirming SageMaker
+  Batch Transform instance-time dominates cost at every scale.
+- `scripts/teardown.sh` and `scripts/smoke_test.sh`: cleanup automation and
+  a real end-to-end post-deploy check.
+- `docs/runbooks/`: stuck-job, high-failure-rate, API-5xx, and
+  deployment-rollback playbooks, cross-referenced from the new alarms.
+- `docs/guides/developer-guide.md`, `docs/guides/disaster-recovery.md`,
+  `docs/architecture/scalability.md`, and root `CONTRIBUTING.md`.
+- ADRs 0014-0016 (GitHub OIDC for CI/CD, alarm/dashboard strategy, prod
+  approval gate via GitHub Environments).
+- `docs/design-review.md`: a staff-engineer-style review of the finished
+  repository.
+- Upgraded `black` and `pytest` to patched versions after `pip-audit`
+  surfaced CVE-2026-32274 and CVE-2025-71176 in the dev toolchain; fixed a
+  Ruff `per-file-ignores` scoping gap for `scripts/`.
+
+This completes the originally planned four-phase roadmap.
+
 ## [0.3.0] - 2026-07-06
 
 ### Added -- Phase 3: Application Implementation

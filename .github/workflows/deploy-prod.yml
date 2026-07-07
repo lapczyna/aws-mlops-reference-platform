@@ -1,0 +1,66 @@
+name: Deploy to production
+
+# Triggered by a version tag, not by push to main -- promotion to prod is a
+# deliberate, human-initiated act (cut the release, then tag it), matching
+# the "one-directional and artifact-based" promotion model in
+# docs/guides/deployment-strategy.md.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify:
+    name: Verify the tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package with dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Full test suite
+        run: pytest --cov --cov-report=term-missing
+
+      - name: cfn-lint
+        run: |
+          pip install cfn-lint
+          cfn-lint template.yaml bootstrap/*.yaml
+
+  deploy:
+    name: sam deploy --config-env prod
+    needs: verify
+    runs-on: ubuntu-latest
+    # The manual approval gate for production lives here: GitHub
+    # Environments support "required reviewers" protection rules, which
+    # pause this job until someone approves the deployment. On private
+    # repos that requires GitHub Team/Enterprise (the same restriction
+    # already noted for branch protection) -- see ADR-0016. Configure it
+    # under Settings > Environments > prod once available.
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: sam build
+        run: sam build --use-container
+
+      - name: sam deploy
+        run: sam deploy --config-env prod --no-confirm-changeset --no-fail-on-empty-changeset

@@ -5,12 +5,12 @@ code or CI workflow YAML.
 
 ## Contents
 
-| Script                     | Purpose                                                              | Status |
-| --------------------------- | ----------------------------------------------------------------------- | ----- |
-| `package_model.sh`           | Trains the Iris model (`ml/train.py`) and uploads `model.tar.gz` to a deployed environment's model artifacts bucket. | Delivered (Phase 3) |
-| `smoke_test.sh`               | Post-deploy smoke test: submits a small batch job end-to-end and checks the result. | Planned (Phase 4) |
-| `estimate_cost.py`            | Renders a cost estimate for a given monthly request volume using the pricing model in the cost guide. | Planned (Phase 4) |
-| `teardown.sh`                 | Safely tears down a named environment stack, emptying buckets first. | Planned (Phase 4) |
+| Script                     | Purpose                                                              |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `package_model.sh`           | Trains the Iris model (`ml/train.py`) and uploads `model.tar.gz` to a deployed environment's model artifacts bucket. |
+| `smoke_test.sh`               | Post-deploy smoke test: submits a real batch job end-to-end (upload -> submit -> poll -> results) and fails loudly if it doesn't reach `COMPLETED`. |
+| `estimate_cost.py`            | Renders a monthly cost estimate for a given job volume; see [`docs/guides/cost-guide.md`](../docs/guides/cost-guide.md), which is generated from this script's output. |
+| `teardown.sh`                 | Tears down a named environment stack, emptying its versioned S3 buckets first (the one manual step that otherwise blocks `sam delete`). |
 
 `sam build` / `sam deploy --config-env <env>` need no wrapper script --
 `samconfig.toml` already carries the per-environment configuration (see the

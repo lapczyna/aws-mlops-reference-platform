@@ -62,6 +62,9 @@ individual request/job flow is diagrammed in
 | Explicit per-function IAM roles, not SAM auto-generated       | [ADR-0011](docs/adr/0011-explicit-per-function-iam-roles.md) -- predictable role names, tighter-than-default logging permissions |
 | API Gateway account settings live in a separate bootstrap stack | [ADR-0012](docs/adr/0012-api-gateway-account-settings-bootstrap.md) -- avoids one environment's teardown clobbering an account-wide singleton |
 | Idempotent job submission via conditional writes              | [ADR-0013](docs/adr/0013-idempotent-job-submission.md) -- retrying `POST /jobs` with the same `job_id` never double-creates a job or a Step Functions execution |
+| GitHub OIDC for CI/CD, no long-lived AWS credentials            | [ADR-0014](docs/adr/0014-github-oidc-for-cicd.md) -- each deploy assumes a short-lived, repo-scoped role via a signed identity token |
+| CloudWatch alarms: aggregate over per-resource                    | [ADR-0015](docs/adr/0015-cloudwatch-alarms-and-dashboard.md) -- 6 meaningful alarms (incl. a business-level failure-rate signal) instead of dozens of near-duplicate ones |
+| Prod approval gate via GitHub Environments                          | [ADR-0016](docs/adr/0016-prod-approval-gate-via-github-environments.md) -- wired correctly today; the reviewer-approval enforcement itself needs a plan upgrade on a private repo |
 
 ## Technology stack
 
@@ -77,13 +80,14 @@ individual request/job flow is diagrammed in
 | Job state               | Amazon DynamoDB                                             |
 | Observability           | Amazon CloudWatch (Logs, Metrics, Alarms, Dashboards)        |
 | Access control           | AWS IAM (least privilege, per-function roles)               |
-| CI/CD                    | GitHub Actions (Phase 4)                                    |
+| CI/CD                    | GitHub Actions (OIDC deploy role, no long-lived credentials) |
 | Testing                   | pytest, moto                                                |
-| Code quality               | Ruff, Black, mypy (strict), pre-commit                      |
+| Code quality               | Ruff, Black, mypy (strict), pre-commit, pip-audit           |
 
 ## Repository structure
 
 ```
+├── .github/workflows/                # CI (lint/typecheck/test/validate) + CD (staging auto-deploy, prod on tag)
 ├── src/batch_inference_platform/   # Application code (Clean Architecture layers)
 │   ├── api/handlers/                 # Lambda handlers (interface layer / composition roots)
 │   ├── application/                  # Use cases and DTOs
@@ -93,21 +97,26 @@ individual request/job flow is diagrammed in
 ├── src/requirements.txt              # Third-party deps packaged into the shared Lambda Layer
 ├── tests/                            # 70 tests, 97% coverage (unit + moto-mocked integration)
 ├── ml/                                # Model training script and packaging (Iris classifier)
-├── scripts/                           # Deployment and operational helper scripts
+├── scripts/                           # package_model, smoke_test, teardown, estimate_cost
 ├── statemachine/
 │   └── job_orchestration.asl.json      # Step Functions state machine definition
 ├── bootstrap/
-│   └── api-gateway-account-settings.yaml # One-time account-level CloudWatch role for API Gateway
+│   ├── api-gateway-account-settings.yaml # One-time account-level CloudWatch role for API Gateway
+│   └── github-oidc-deploy-role.yaml       # One-time account-level GitHub Actions deploy role (OIDC)
 ├── docs/
-│   ├── architecture/                    # Overview + sequence diagrams
+│   ├── architecture/                    # Overview, sequence diagrams, scalability
 │   ├── adr/                              # Architecture Decision Records
-│   ├── standards/                         # Naming conventions, coding standards
-│   ├── guides/                             # Development, deployment, cost, security guides
-│   └── roadmap.md                          # Phased delivery plan
+│   ├── security/                          # Threat model
+│   ├── runbooks/                           # Operational playbooks
+│   ├── standards/                          # Naming conventions, coding standards
+│   ├── guides/                               # Development, deployment, cost, security, DR, developer guides
+│   ├── roadmap.md                             # Phased delivery plan
+│   └── design-review.md                        # Staff-engineer-style review of this repository
 ├── template.yaml                       # AWS SAM template: API Gateway, Lambda, Step Functions,
-│                                          # S3, DynamoDB, IAM, SageMaker, CloudWatch
+│                                          # S3, DynamoDB, IAM, SageMaker, CloudWatch, alarms, dashboard
 ├── samconfig.toml                      # Per-environment (dev/staging/prod) deploy configuration
 ├── pyproject.toml                      # Project metadata, Ruff/Black/mypy/pytest config
+├── CONTRIBUTING.md                     # PR process, definition of done
 └── Makefile                            # Common developer commands
 ```
 
@@ -141,15 +150,23 @@ See [`ml/README.md`](ml/README.md) for details.
 Start at the [documentation index](docs/README.md) for the full map. Key
 entry points:
 
-- [Architecture overview](docs/architecture/overview.md)
-- [Sequence diagrams](docs/architecture/sequence-diagrams.md)
+- [Architecture overview](docs/architecture/overview.md) ·
+  [Sequence diagrams](docs/architecture/sequence-diagrams.md) ·
+  [Scalability & performance](docs/architecture/scalability.md)
 - [Architecture Decision Records](docs/adr/README.md)
+- [Security guide](docs/guides/security-guide.md) ·
+  [Threat model](docs/security/threat-model.md)
 - [Naming conventions](docs/standards/naming-conventions.md) ·
   [Coding standards](docs/standards/coding-standards.md)
 - [Development environment](docs/guides/development-environment.md) ·
-  [Deployment strategy](docs/guides/deployment-strategy.md) ·
-  [Deployment guide](docs/guides/deployment-guide.md)
-- [Project roadmap](docs/roadmap.md)
+  [Developer guide](docs/guides/developer-guide.md)
+- [Deployment strategy](docs/guides/deployment-strategy.md) ·
+  [Deployment guide](docs/guides/deployment-guide.md) ·
+  [Disaster recovery](docs/guides/disaster-recovery.md)
+- [Cost guide](docs/guides/cost-guide.md) ·
+  [Runbooks](docs/runbooks/README.md)
+- [Project roadmap](docs/roadmap.md) ·
+  [Design review](docs/design-review.md)
 
 ## Design principles
 
@@ -173,7 +190,13 @@ phase plan and what's deferred beyond it.
 | 1     | Repository foundation, architecture, docs      | Complete (`v0.1.0`) |
 | 2     | Infrastructure as Code (AWS SAM)                | Complete (`v0.2.0`) |
 | 3     | Application implementation                       | Complete (`v0.3.0`) |
-| 4     | Enterprise production readiness (CI/CD, observability, security review) | Not started |
+| 4     | Enterprise production readiness (CI/CD, observability, security review) | Complete (`v0.4.0`) |
+
+This completes the originally planned roadmap. See the
+[design review](docs/design-review.md) for an outside-in assessment of the
+result and what a next iteration should prioritize, and
+["Beyond Phase 4"](docs/roadmap.md#beyond-phase-4--candidate-future-enhancements)
+for the specific deferred items.
 
 ## License
 

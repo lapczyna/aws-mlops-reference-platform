@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  One-time, account-wide prerequisite for GitHub Actions to deploy this
+  platform without any long-lived AWS credentials stored as repository
+  secrets. Creates (or reuses) the GitHub OIDC identity provider and an IAM
+  role that GitHub Actions assumes via short-lived, per-run web identity
+  tokens, scoped to this exact repository and to the two refs the CD
+  workflows actually run from (the main branch and version tags).
+
+  Deploy this once per AWS account, before the first CD workflow run. See
+  ADR-0014 and docs/guides/deployment-guide.md.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or user that owns the repository (e.g. "lapczyna").
+
+  GitHubRepo:
+    Type: String
+    Default: aws-mlops-reference-platform
+    Description: Repository name (without the org/ prefix).
+
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: >-
+      Set to false if this AWS account already has a
+      token.actions.githubusercontent.com OIDC provider registered (it is a
+      per-account singleton, commonly shared across many repositories/CI
+      setups) -- creating a second one for the same URL fails.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  GitHubActionsOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # AWS validates GitHub's OIDC tokens against its actual, current
+      # signing certificate rather than this value in practice, but the
+      # field is still required by the resource schema. This is GitHub's
+      # long-published root CA thumbprint.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: batch-inference-github-actions-deploy
+      Description: Assumed by GitHub Actions (OIDC) to deploy the batch-inference-platform stacks.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubActionsOidcProvider
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+              StringLike:
+                'token.actions.githubusercontent.com:sub':
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main'
+                  - !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/tags/v*'
+      Policies:
+        - PolicyName: DeployBatchInferencePlatform
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudFormation actions that exist before any stack does
+              # (e.g. ValidateTemplate, ListStacks) have no resource to
+              # scope to and require Resource: "*"; stack lifecycle actions
+              # below are scoped to our stacks specifically.
+              - Sid: CloudFormationAccountLevel
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                  - cloudformation:ListExports
+                Resource: '*'
+              - Sid: CloudFormationStackManagement
+                Effect: Allow
+                Action: 'cloudformation:*'
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/batch-inference-*/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
+              - Sid: SamManagedArtifactsBucket
+                Effect: Allow
+                Action: 's3:*'
+                Resource:
+                  - 'arn:aws:s3:::aws-sam-cli-managed-default*'
+                  - 'arn:aws:s3:::aws-sam-cli-managed-default*/*'
+              - Sid: ApplicationDataBuckets
+                Effect: Allow
+                Action: 's3:*'
+                Resource:
+                  - 'arn:aws:s3:::batch-inference-*'
+                  - 'arn:aws:s3:::batch-inference-*/*'
+              - Sid: ManageApplicationIamRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/batch-inference-*'
+              - Sid: ManageLambda
+                Effect: Allow
+                Action: 'lambda:*'
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:batch-inference-*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:batch-inference-*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:batch-inference-*:*'
+              - Sid: ManageStepFunctions
+                Effect: Allow
+                Action: 'states:*'
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:batch-inference-*'
+              - Sid: ManageDynamoDb
+                Effect: Allow
+                Action: 'dynamodb:*'
+                Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/batch-inference-*'
+              - Sid: ManageSageMaker
+                Effect: Allow
+                Action: 'sagemaker:*'
+                Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:model/batch-inference-*'
+              - Sid: ManageSnsTopics
+                Effect: Allow
+                Action: 'sns:*'
+                Resource: !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:batch-inference-*'
+              # API Gateway and CloudWatch Logs/Alarms resource ARNs are
+              # assigned an opaque ID at creation time (not our chosen
+              # name), so they cannot be scoped by name before the fact --
+              # a documented, deliberate exception to the naming-based
+              # scoping used everywhere else in this policy.
+              - Sid: ManageApiGatewayAndObservability
+                Effect: Allow
+                Action:
+                  - 'apigateway:*'
+                  - 'logs:*'
+                  - 'cloudwatch:*'
+                Resource: '*'
+              - Sid: ManageOptionalKmsKey
+                Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:CreateAlias
+                  - kms:DeleteAlias
+                  - kms:DescribeKey
+                  - kms:EnableKeyRotation
+                  - kms:GetKeyPolicy
+                  - kms:GetKeyRotationStatus
+                  - kms:ListResourceTags
+                  - kms:PutKeyPolicy
+                  - kms:ScheduleKeyDeletion
+                  - kms:TagResource
+                  - kms:UntagResource
+                Resource: '*'
+
+Outputs:
+  DeployRoleArn:
+    Description: >-
+      Role ARN to store as the AWS_DEPLOY_ROLE_ARN repository variable (or
+      per-environment GitHub Environment variable) consumed by the CD
+      workflows.
+    Value: !GetAtt GitHubActionsDeployRole.Arn

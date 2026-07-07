@@ -24,6 +24,10 @@ in the log for historical context.
 | [0011](0011-explicit-per-function-iam-roles.md) | Explicit per-function IAM roles instead of SAM auto-generated roles | Accepted |
 | [0012](0012-api-gateway-account-settings-bootstrap.md) | API Gateway account settings as a separate bootstrap stack | Accepted |
 | [0013](0013-idempotent-job-submission.md) | Idempotent job submission via conditional writes            | Accepted |
+| [0014](0014-github-oidc-for-cicd.md) | GitHub OIDC for CI/CD, no long-lived AWS credentials              | Accepted |
+| [0015](0015-cloudwatch-alarms-and-dashboard.md) | CloudWatch alarms strategy -- aggregate over per-resource      | Accepted |
+| [0016](0016-prod-approval-gate-via-github-environments.md) | Production approval gate via GitHub Environments  | Accepted (partially blocked by plan) |
 
-Further ADRs will be added in later phases as security, CI/CD promotion, and
-operational decisions are made (e.g. alarm thresholds, dashboard design).
+This is the final phase of the initial roadmap; further ADRs will be added
+as the platform continues to evolve post-launch (e.g. alarm threshold
+tuning against real traffic, a multi-region DR decision if pursued).

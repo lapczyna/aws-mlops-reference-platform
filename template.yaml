@@ -102,12 +102,22 @@ Parameters:
     Default: ERROR
     Description: Step Functions execution logging verbosity. ALL is useful for debugging but increases log volume/cost.
 
+  AlarmNotificationEmail:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional email address subscribed to the alarm notification SNS
+      topic. Leave blank to create the topic without a subscription (e.g.
+      to wire up ChatOps/PagerDuty integrations out of band instead). See
+      ADR-0015.
+
 # -----------------------------------------------------------------------------
 # Conditions
 # -----------------------------------------------------------------------------
 Conditions:
   UseCustomerManagedKey: !Equals [!Ref EnableCustomerManagedKey, 'true']
   IsProd: !Equals [!Ref Environment, prod]
+  HasAlarmNotificationEmail: !Not [!Equals [!Ref AlarmNotificationEmail, '']]
 
 # -----------------------------------------------------------------------------
 # Globals
@@ -886,6 +896,295 @@ Resources:
           - CloudWatchLogsLogGroup:
               LogGroupArn: !GetAtt StateMachineLogGroup.Arn
 
+  # --- Observability: alarms, notifications, dashboard (ADR-0015) -------------------
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'batch-inference-${Environment}-alarms'
+      KmsMasterKeyId: !If [UseCustomerManagedKey, !Ref InferenceDataKey, !Ref 'AWS::NoValue']
+
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmNotificationEmail
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'batch-inference-${Environment}-api-5xx'
+      AlarmDescription: The REST API is returning server errors -- check the access/execution logs and recent deploys.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'batch-inference-${Environment}-api'
+        - Name: Stage
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+      OKActions: [!Ref AlarmNotificationTopic]
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'batch-inference-${Environment}-lambda-errors'
+      AlarmDescription: !Sub >-
+        One (aggregate) alarm across all six functions rather than six
+        near-duplicate ones -- see ADR-0015. Check CloudWatch Logs Insights
+        across the /aws/lambda/batch-inference-${Environment}-fn-* log
+        groups to find which function and why.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Threshold: 1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: presign_upload
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref PresignUploadFunction
+        - Id: submit_job
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref SubmitJobFunction
+        - Id: get_job_status
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref GetJobStatusFunction
+        - Id: get_job_results
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref GetJobResultsFunction
+        - Id: validate_input
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ValidateInputFunction
+        - Id: record_outcome
+          ReturnData: false
+          MetricStat:
+            Period: 300
+            Stat: Sum
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref RecordOutcomeFunction
+        - Id: total_errors
+          Label: TotalLambdaErrors
+          ReturnData: true
+          Expression: >-
+            presign_upload + submit_job + get_job_status + get_job_results +
+            validate_input + record_outcome
+      AlarmActions: [!Ref AlarmNotificationTopic]
+      OKActions: [!Ref AlarmNotificationTopic]
+
+  StepFunctionsFailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'batch-inference-${Environment}-orchestration-failures'
+      AlarmDescription: A batch inference job orchestration ended in JobFailed -- see the runbooks for triage steps.
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref JobOrchestrationStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+      OKActions: [!Ref AlarmNotificationTopic]
+
+  DynamoDbThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'batch-inference-${Environment}-jobs-table-throttles'
+      AlarmDescription: The Jobs table is being throttled -- unexpected on-demand capacity, investigate traffic patterns.
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref JobsTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+      OKActions: [!Ref AlarmNotificationTopic]
+
+  JobFailureRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'batch-inference-${Environment}-job-failure-rate'
+      AlarmDescription: >-
+        Business-level signal (not infrastructure): batch inference jobs
+        are completing in a FAILED state. See
+        docs/runbooks/high-failure-rate.md.
+      Namespace: BatchInferencePlatform
+      MetricName: JobFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+      OKActions: [!Ref AlarmNotificationTopic]
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'batch-inference-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway -- requests & errors",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "batch-inference-${Environment}-api", "Stage", "${Environment}", {"label": "Requests"}],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "batch-inference-${Environment}-api", "Stage", "${Environment}", {"label": "4xx"}],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "batch-inference-${Environment}-api", "Stage", "${Environment}", {"label": "5xx"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "API Gateway -- latency",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300,
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "batch-inference-${Environment}-api", "Stage", "${Environment}", {"label": "p50", "stat": "p50"}],
+                  ["AWS/ApiGateway", "Latency", "ApiName", "batch-inference-${Environment}-api", "Stage", "${Environment}", {"label": "p99", "stat": "p99"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda -- invocations & errors (all functions)",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${PresignUploadFunction}", {"label": "PresignUpload", "id": "i1", "visible": false}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${SubmitJobFunction}", {"label": "SubmitJob", "id": "i2", "visible": false}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${GetJobStatusFunction}", {"label": "GetJobStatus", "id": "i3", "visible": false}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${GetJobResultsFunction}", {"label": "GetJobResults", "id": "i4", "visible": false}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ValidateInputFunction}", {"label": "ValidateInput", "id": "i5", "visible": false}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${RecordOutcomeFunction}", {"label": "RecordOutcome", "id": "i6", "visible": false}],
+                  [{"expression": "i1+i2+i3+i4+i5+i6", "label": "Total invocations", "id": "total_invocations"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${PresignUploadFunction}", {"label": "PresignUpload", "id": "e1", "visible": false}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${SubmitJobFunction}", {"label": "SubmitJob", "id": "e2", "visible": false}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${GetJobStatusFunction}", {"label": "GetJobStatus", "id": "e3", "visible": false}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${GetJobResultsFunction}", {"label": "GetJobResults", "id": "e4", "visible": false}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ValidateInputFunction}", {"label": "ValidateInput", "id": "e5", "visible": false}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${RecordOutcomeFunction}", {"label": "RecordOutcome", "id": "e6", "visible": false}],
+                  [{"expression": "e1+e2+e3+e4+e5+e6", "label": "Total errors", "id": "total_errors"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda -- p99 duration by function",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "p99",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${PresignUploadFunction}", {"label": "PresignUpload"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${SubmitJobFunction}", {"label": "SubmitJob"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${GetJobStatusFunction}", {"label": "GetJobStatus"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${GetJobResultsFunction}", {"label": "GetJobResults"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ValidateInputFunction}", {"label": "ValidateInput"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${RecordOutcomeFunction}", {"label": "RecordOutcome"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Step Functions -- job orchestration executions",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["AWS/States", "ExecutionsStarted", "StateMachineArn", "${JobOrchestrationStateMachine}", {"label": "Started"}],
+                  ["AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${JobOrchestrationStateMachine}", {"label": "Succeeded"}],
+                  ["AWS/States", "ExecutionsFailed", "StateMachineArn", "${JobOrchestrationStateMachine}", {"label": "Failed"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "DynamoDB -- Jobs table capacity & throttles",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${JobsTable}", {"label": "Read capacity"}],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${JobsTable}", {"label": "Write capacity"}],
+                  ["AWS/DynamoDB", "ThrottledRequests", "TableName", "${JobsTable}", {"label": "Throttled requests"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 18, "width": 24, "height": 6,
+              "properties": {
+                "title": "Business metrics -- job outcomes (BatchInferencePlatform namespace)",
+                "view": "timeSeries", "region": "${AWS::Region}", "period": 300, "stat": "Sum",
+                "metrics": [
+                  ["BatchInferencePlatform", "JobCompleted", {"label": "Completed"}],
+                  ["BatchInferencePlatform", "JobFailed", {"label": "Failed"}]
+                ]
+              }
+            }
+          ]
+        }
+
 # -----------------------------------------------------------------------------
 # Outputs
 # -----------------------------------------------------------------------------
@@ -921,3 +1220,11 @@ Outputs:
   ModelName:
     Description: Name of the registered SageMaker Model used by Batch Transform.
     Value: !Ref InferenceModel
+
+  AlarmNotificationTopicArn:
+    Description: SNS topic alarms notify. Subscribe additional endpoints (Slack, PagerDuty) to this ARN as needed.
+    Value: !Ref AlarmNotificationTopic
+
+  DashboardUrl:
+    Description: CloudWatch console URL for this environment's operations dashboard.
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationsDashboard}'

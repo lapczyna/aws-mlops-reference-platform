@@ -50,6 +50,54 @@ Skip this if the target account already has an API Gateway CloudWatch Logs
 role configured (check the API Gateway console under Settings > Logs; if a
 role ARN is already shown, it's already done).
 
+## One-time per account: GitHub Actions OIDC deploy role
+
+Also a singleton, also deployed once, also separate from the environment
+stacks for the same reason (see
+[ADR-0012](../adr/0012-api-gateway-account-settings-bootstrap.md) and
+[ADR-0014](../adr/0014-github-oidc-for-cicd.md)):
+
+```bash
+sam deploy \
+  --template-file bootstrap/github-oidc-deploy-role.yaml \
+  --stack-name github-oidc-deploy-role \
+  --parameter-overrides GitHubOrg=<your-github-org-or-user> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --resolve-s3
+```
+
+Take the `DeployRoleArn` output and set it as the `AWS_DEPLOY_ROLE_ARN`
+variable on the `staging` and `prod` GitHub Environments (Settings >
+Environments > *environment name* > Environment variables). No AWS access
+keys are ever stored in GitHub -- each workflow run assumes this role via a
+short-lived OIDC token scoped to this exact repository and ref (`main` for
+staging, `v*` tags for prod).
+
+## Continuous deployment
+
+Three workflows in `.github/workflows/` automate the flow described in the
+[deployment strategy guide](deployment-strategy.md):
+
+| Workflow               | Trigger                          | Does                                                    |
+| ------------------------ | ----------------------------------- | ------------------------------------------------------------ |
+| `ci.yml`                  | Every PR, every push to `main`        | Lint, typecheck, test, validate/build the SAM template, train + smoke-test the model. |
+| `deploy-staging.yml`       | `ci.yml` succeeding on `main`          | `sam deploy --config-env staging`. |
+| `deploy-prod.yml`          | Pushing a `v*.*.*` tag                 | Re-verifies the tagged commit, then `sam deploy --config-env prod` behind the `prod` GitHub Environment's approval gate. |
+
+Cutting a release is therefore: merge to `main` (staging deploys
+automatically), confirm it behaves correctly, then `git tag vX.Y.Z && git
+push origin vX.Y.Z` to promote the exact same commit to `prod`.
+
+**Manual approval gate note:** `deploy-prod.yml` targets the `prod` GitHub
+Environment specifically so a "required reviewers" protection rule can be
+attached to it. Like branch protection, environment protection rules on a
+*private* repository require GitHub Team/Enterprise (public repos and paid
+private plans get it for free) -- see
+[ADR-0016](../adr/0016-prod-approval-gate-via-github-environments.md). Until
+that's available, `deploy-prod.yml` still only runs on an explicit tag push
+(never automatically), which is itself a deliberate, human-initiated
+action -- just without a second human's sign-off enforced by GitHub.
+
 ## Deploying an environment
 
 ```bash
@@ -63,9 +111,11 @@ defaults if you omit `--config-env`; since `samconfig.toml` already defines
 tags, and parameter overrides for each, `--config-env <name>` is all you
 need.
 
-`prod` deploys should go through CI once Phase 4 lands (manual approval
-gate); deploying `prod` by hand from a laptop is meant for the reference
-architecture's demonstration purposes only.
+`prod` deploys go through the `deploy-prod.yml` workflow (tag push), not a
+laptop -- see [Continuous deployment](#continuous-deployment) above.
+Deploying `prod` by hand with these same commands still works and is
+useful for a first manual walkthrough, but isn't the intended steady-state
+path.
 
 ### What gets created
 
@@ -123,31 +173,25 @@ section.
 
 ## Tearing down an environment
 
-```bash
-sam delete --config-env dev
-```
-
 The three S3 buckets are versioned; `DatasetsBucket` and `ResultsBucket`
-have `DeletionPolicy: Delete` but CloudFormation cannot delete a
-non-empty bucket. If `sam delete` fails on a bucket, empty all versions
-first:
+have `DeletionPolicy: Delete` but CloudFormation cannot delete a non-empty
+bucket, so a bare `sam delete` fails on them. Use
+[`scripts/teardown.sh`](../../scripts/teardown.sh), which empties both
+buckets first and then runs `sam delete` (which still prompts for
+confirmation -- this script doesn't suppress that):
 
 ```bash
-aws s3api list-object-versions --bucket <bucket-name> --output json \
-  | jq -r '.Versions[]?, .DeleteMarkers[]? | "\(.Key) \(.VersionId)"' \
-  | while read -r key version; do
-      aws s3api delete-object --bucket <bucket-name> --key "$key" --version-id "$version"
-    done
-sam delete --config-env dev
+scripts/teardown.sh dev
 ```
 
 `ModelArtifactsBucket` has `DeletionPolicy: Retain` deliberately -- trained
-model artifacts should survive an environment teardown. Delete it
-explicitly if you really want to remove it.
+model artifacts should survive a routine environment teardown, so the
+script leaves it alone by default. Pass `--purge-model-artifacts` if you
+genuinely want it gone too:
 
-Fully automated, safe-by-default cleanup (emptying buckets automatically as
-part of `sam delete`) is planned as Phase 4 tooling -- see
-[`scripts/README.md`](../../scripts/README.md).
+```bash
+scripts/teardown.sh dev --purge-model-artifacts
+```
 
 ## Troubleshooting
 

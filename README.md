@@ -1,5 +1,7 @@
 # Batch Inference Platform
 
+[![CI](https://github.com/lapczyna/aws-mlops-reference-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/lapczyna/aws-mlops-reference-platform/actions/workflows/ci.yml)
+
 A serverless, production-oriented reference platform for asynchronous ML
 batch inference on AWS: upload a dataset, submit an inference job, track its
 progress, and retrieve predictions -- all on managed, pay-per-use AWS
